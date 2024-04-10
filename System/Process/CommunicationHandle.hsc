@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 
 module System.Process.CommunicationHandle
@@ -23,11 +24,12 @@ import Foreign.C (CInt(..), throwErrnoIf_)
 import GHC.IO.Handle (Handle())
 #if defined(mingw32_HOST_OS)
 import Foreign.Marshal (alloca)
-import Foreign.Ptr (Ptr, ptrToWordPtr, wordPtrToPtr)
+import Foreign.Ptr (ptrToWordPtr, wordPtrToPtr)
 import Foreign.Storable (Storable(peek))
 import GHC.IO.Handle.FD (fdToHandle)
 import GHC.IO.IOMode (IOMode(ReadMode, WriteMode))
 import GHC.Windows (throwGetLastError)
+import System.Process.Windows (c_mkNamedPipe, pattern InheritRead, pattern InheritWrite)
 ##  if defined(__IO_MANAGER_WINIO__)
 import Control.Exception (catch, throwIO)
 import Foreign.Ptr (nullPtr)
@@ -153,6 +155,7 @@ openCommunicationHandleWrite = useCommunicationHandle False
 -- 'openCommunicationHandleWrite'.
 useCommunicationHandle :: Bool -> CommunicationHandle -> IO Handle
 useCommunicationHandle _wantToRead (CommunicationHandle ch) = do
+  putStrLn $ "Use communicationHandle, child wantToRead = " ++ show _wantToRead
   ch' <-
     return ch
 ##if defined(__IO_MANAGER_WINIO__)
@@ -190,13 +193,13 @@ associateHandleWithFallback wantToRead = go True
         --   associateHandleWithIOCP: invalid argument (The parameter is incorrect.)
         | InvalidArgument <- errTy
         , Just 22 <- mbErrNo
-        = if tryReOpening
+        = if tryReOpening && not wantToRead
           then do
             -- Try to re-open the HANDLE in overlapped mode.
             --
-            -- TODO: this seems to never actual works; we get:
+            -- TODO: this seems to never actually work; we get:
             --
-            --  > permission denied (Access is denied.)
+            --  > invalid argument (All pipe instances are busy.)
             --
             -- It seems we can't re-open one side of a pipe created with
             -- mkNamedPipe, even without FILE_FLAG_FIRST_PIPE_INSTANCE and
@@ -287,9 +290,9 @@ createTheyReadWeWritePipe = sw <$> createCommunicationPipe sw
 createCommunicationPipe
   :: ( forall a. (a, a) -> (a, a) )
   -> IO (Handle, CommunicationHandle)
-createCommunicationPipe mbSwap = do
+createCommunicationPipe swapIfTheyReadWeWrite = do
 ##if !defined(mingw32_HOST_OS)
-  (ourHandle, theirHandle) <- mbSwap <$> createPipe
+  (ourHandle, theirHandle) <- swapIfTheyReadWeWrite <$> createPipe
   -- Don't allow the child process to inherit a parent file descriptor
   -- (such inheritance happens by default on Unix).
   ourFD   <- Fd . fdFD <$> handleToFd ourHandle
@@ -303,22 +306,23 @@ createCommunicationPipe mbSwap = do
       <!> return True
 ##  endif
   -- On Windows, use mkNamedPipe to create the two pipe ends.
-  alloca $ \ pfdStdInput  ->
-    alloca $ \ pfdStdOutput -> do
-      let (inheritRead, inheritWrite) = mbSwap (False, True)
-          -- If we're using WinIO, make the parent pipe end overlapped,
-          -- otherwise make both pipe ends synchronous.
-          overlappedRead  = if inheritRead  then False else trueForWinIO
-          overlappedWrite = if inheritWrite then False else trueForWinIO
+  alloca $ \ pfdReadEnd  ->
+    alloca $ \ pfdWriteEnd -> do
+      let (inheritRead, _inheritWrite) = swapIfTheyReadWeWrite (False, True)
+          pipeInheritance = if inheritRead
+                            then InheritRead
+                            else InheritWrite
+          isOverlappedParent = trueForWinIO
+          isOverlappedChild = False
       throwErrnoIf_ (==False) "c_mkNamedPipe" $
-        -- Create one end to be un-inheritable and the other
-        -- to be inheritable, which ensures the parent end can be properly
-        -- associated with the parent process.
         c_mkNamedPipe
-          pfdStdInput  inheritRead  overlappedRead
-          pfdStdOutput inheritWrite overlappedWrite
+          pipeInheritance
+          isOverlappedParent
+          isOverlappedChild
+          pfdReadEnd
+          pfdWriteEnd
       let ((ourPtr, ourMode), (theirPtr, _theirMode)) =
-            mbSwap ((pfdStdInput, ReadMode), (pfdStdOutput, WriteMode))
+            swapIfTheyReadWeWrite ((pfdReadEnd, ReadMode), (pfdWriteEnd, WriteMode))
       ourHANDLE  <- peek ourPtr
       theirHANDLE <- peek theirPtr
       -- With WinIO, we need to associate any handles we are going to use in
@@ -336,10 +340,6 @@ createCommunicationPipe mbSwap = do
         rawHANDLEToHandle ourMode ourHANDLE
 ##  endif
       return $ (ourHandle, CommunicationHandle theirHANDLE)
-
-foreign import ccall "mkNamedPipe" c_mkNamedPipe ::
-    Ptr HANDLE -> Bool -> Bool -> Ptr HANDLE -> Bool -> Bool -> IO Bool
-
 ##endif
 
 --------------------------------------------------------------------------------
@@ -376,8 +376,8 @@ readCreateProcessWithExitCodeCommunicationHandle
     -- ^ write action
   -> IO (ExitCode, a)
 readCreateProcessWithExitCodeCommunicationHandle mkProg readAction writeAction = do
-  (chTheyRead, hWeWrite   ) <- createTheyReadWeWritePipe
   (hWeRead   , chTheyWrite) <- createWeReadTheyWritePipe
+  (chTheyRead, hWeWrite   ) <- createTheyReadWeWritePipe
   let cp = mkProg (chTheyRead, chTheyWrite)
   -- The following implementation parallels 'readCreateProcess'
   withCreateProcess cp $ \ _ _ _ ph -> do

@@ -31,54 +31,60 @@
  *           optionally (non-)inheritable.
  */
 static BOOL
-mkAnonPipe (HANDLE* pHandleIn, BOOL isInheritableIn,
-            HANDLE* pHandleOut, BOOL isInheritableOut)
+mkAnonPipe (HANDLE* pHandleReadEnd, BOOL isInheritableIn,
+            HANDLE* pHandleWriteEnd, BOOL isInheritableOut)
 {
-    HANDLE hTemporaryIn  = NULL;
-    HANDLE hTemporaryOut = NULL;
+    HANDLE hTemporaryParent  = NULL;
+    HANDLE hTemporaryChild = NULL;
 
     /* Create the anon pipe with both ends inheritable */
-    if (!CreatePipe(&hTemporaryIn, &hTemporaryOut, NULL, 0))
+    if (!CreatePipe(&hTemporaryParent, &hTemporaryChild, NULL, 0))
     {
         maperrno();
-        *pHandleIn  = NULL;
-        *pHandleOut = NULL;
+        *pHandleReadEnd  = NULL;
+        *pHandleWriteEnd = NULL;
         return FALSE;
     }
 
     if (isInheritableIn) {
         // SetHandleInformation requires at least Win2k
-        if (!SetHandleInformation(hTemporaryIn,
+        if (!SetHandleInformation(hTemporaryParent,
                                   HANDLE_FLAG_INHERIT,
                                   HANDLE_FLAG_INHERIT))
         {
             maperrno();
-            *pHandleIn  = NULL;
-            *pHandleOut = NULL;
-            CloseHandle(hTemporaryIn);
-            CloseHandle(hTemporaryOut);
+            *pHandleReadEnd  = NULL;
+            *pHandleWriteEnd = NULL;
+            CloseHandle(hTemporaryParent);
+            CloseHandle(hTemporaryChild);
             return FALSE;
         }
     }
-    *pHandleIn = hTemporaryIn;
+    *pHandleReadEnd = hTemporaryParent;
 
     if (isInheritableOut) {
-        if (!SetHandleInformation(hTemporaryOut,
+        if (!SetHandleInformation(hTemporaryChild,
                                   HANDLE_FLAG_INHERIT,
                                   HANDLE_FLAG_INHERIT))
         {
             maperrno();
-            *pHandleIn  = NULL;
-            *pHandleOut = NULL;
-            CloseHandle(hTemporaryIn);
-            CloseHandle(hTemporaryOut);
+            *pHandleReadEnd  = NULL;
+            *pHandleWriteEnd = NULL;
+            CloseHandle(hTemporaryParent);
+            CloseHandle(hTemporaryChild);
             return FALSE;
         }
     }
-    *pHandleOut = hTemporaryOut;
+    *pHandleWriteEnd = hTemporaryChild;
 
     return TRUE;
 }
+
+enum PipeInheritance {
+  NoInheritance,
+  InheritRead,
+  InheritWrite
+};
 
 /*
  * Function: mkNamedPipe
@@ -88,11 +94,10 @@ mkAnonPipe (HANDLE* pHandleIn, BOOL isInheritableIn,
  *           asynchronously while anonymous pipes require blocking calls.
  */
 BOOL
-mkNamedPipe (HANDLE* pHandleIn, BOOL isInheritableIn, BOOL isOverlappedIn,
-             HANDLE* pHandleOut, BOOL isInheritableOut, BOOL isOverlappedOut)
+mkNamedPipe (enum PipeInheritance inherit, BOOL isOverlappedParentEnd, BOOL isOverlappedChildEnd, HANDLE* pHandleReadEnd, HANDLE* pHandleWriteEnd)
 {
-    HANDLE hTemporaryIn  = INVALID_HANDLE_VALUE;
-    HANDLE hTemporaryOut = INVALID_HANDLE_VALUE;
+    HANDLE hTemporaryParent = INVALID_HANDLE_VALUE;
+    HANDLE hTemporaryChild = INVALID_HANDLE_VALUE;
     RPC_WSTR guidStr = NULL;
     GUID guid;
 
@@ -107,7 +112,7 @@ mkNamedPipe (HANDLE* pHandleIn, BOOL isInheritableIn, BOOL isOverlappedIn,
 
     /* Now we create the pipe name.  */
     wchar_t pipeName[MAX_PATH];
-    if (-1 == swprintf_s (&pipeName[0],  MAX_PATH, L"\\\\.\\pipe\\haskell:process:%ls\n",  guidStr))
+    if (-1 == swprintf_s (&pipeName[0], MAX_PATH, L"\\\\.\\pipe\\haskell:process:%ls\n", guidStr))
         goto fail;
 
     const int buffer_size = 8 * 1024;
@@ -118,9 +123,11 @@ mkNamedPipe (HANDLE* pHandleIn, BOOL isInheritableIn, BOOL isOverlappedIn,
     ZeroMemory (&secAttr, sizeof(secAttr));
     secAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
     secAttr.lpSecurityDescriptor = NULL;
-    secAttr.bInheritHandle = isInheritableIn;
+    secAttr.bInheritHandle = false; // parent side is never inheritable
 
-    /* Create one end of the pipe. Named pipes are a bit less secure than
+    //wprintf(L"Created named pipe with inherit = %d, name %ls\n", inherit, pipeName);
+
+    /* Create the parent end of the pipe. Named pipes are a bit less secure than
        anonymous pipes.  Because of this we restrict the pipe's access to only
        one client and also only the local host.  This means after we create the
        other end of the pipe it should be as secure as an anonymous pipe.
@@ -142,32 +149,77 @@ mkNamedPipe (HANDLE* pHandleIn, BOOL isInheritableIn, BOOL isOverlappedIn,
        bytes and the error ERROR_NO_DATA."[0]
 
        [0] https://devblogs.microsoft.com/oldnewthing/20110114-00/?p=11753  */
-    DWORD inAttr = isOverlappedIn ? FILE_FLAG_OVERLAPPED : 0;
-    hTemporaryIn
+    DWORD inAttr = isOverlappedParentEnd ? FILE_FLAG_OVERLAPPED : 0;
+    DWORD parentReadOrWrite;
+    switch (inherit) {
+      case InheritRead: // parent writes
+        parentReadOrWrite = PIPE_ACCESS_OUTBOUND;
+        break;
+      default: // parent reads
+        parentReadOrWrite = PIPE_ACCESS_INBOUND;
+    };
+    hTemporaryParent
       = CreateNamedPipeW (pipeName,
-                          PIPE_ACCESS_INBOUND | inAttr, // | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                          PIPE_TYPE_MESSAGE | PIPE_REJECT_REMOTE_CLIENTS | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                          PIPE_UNLIMITED_INSTANCES, buffer_size, buffer_size,
+                          parentReadOrWrite | inAttr, // | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT , // | PIPE_REJECT_REMOTE_CLIENTS,
+                          PIPE_UNLIMITED_INSTANCES, // 1
+                          buffer_size, buffer_size,
                           0,
                           &secAttr);
-    if (hTemporaryIn == INVALID_HANDLE_VALUE)
+    if (hTemporaryParent == INVALID_HANDLE_VALUE)
       goto fail;
 
+    if (isOverlappedParentEnd) {
+      OVERLAPPED overlapped;
+
+      // Initialize the overlapped structure
+      memset(&overlapped, 0, sizeof(OVERLAPPED));
+      overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+      if (overlapped.hEvent == NULL) {
+          printf("Failed to create event. Error code: %d\n", GetLastError());
+          goto fail;
+      }
+
+      // Connect to the pipe asynchronously
+      BOOL bSuccess;
+      bSuccess = ConnectNamedPipe(hTemporaryParent, &overlapped);
+      if (!bSuccess && GetLastError() != ERROR_IO_PENDING) {
+          CloseHandle(overlapped.hEvent);
+          goto fail;
+      }
+    }
+
     /* And now open the other end, using the inverse access permissions.  This
-       will give us the read and write ends of the pipe.  */
-    secAttr.bInheritHandle = isInheritableOut;
-    hTemporaryOut
+       will give us the read and write ends of the pipe. */
+    switch (inherit) {
+      case NoInheritance:
+        secAttr.bInheritHandle = false;
+        break;
+      default:
+        secAttr.bInheritHandle = true;
+    }
+    DWORD childReadOrWrite;
+    DWORD childShareReadOrWrite;
+    switch (inherit) {
+      case InheritRead:
+        childReadOrWrite = GENERIC_READ;
+        childShareReadOrWrite = FILE_SHARE_READ;
+        break;
+      default:
+        childReadOrWrite = GENERIC_WRITE;
+        childShareReadOrWrite = FILE_SHARE_WRITE;
+    };
+    hTemporaryChild
       = CreateFileW (pipeName,
-                     GENERIC_WRITE,
-                     FILE_SHARE_WRITE,
+                     childReadOrWrite,
+                     childShareReadOrWrite,
                      &secAttr,
                      OPEN_EXISTING,
-                     isOverlappedOut
+                     isOverlappedChildEnd
                        ? FILE_FLAG_OVERLAPPED
                        : FILE_ATTRIBUTE_NORMAL,
                      NULL);
-
-    if (hTemporaryOut == INVALID_HANDLE_VALUE)
+    if (hTemporaryChild == INVALID_HANDLE_VALUE)
       goto fail;
 
     /* Ensure that read and write ends are set to the same mode.  MESSAGE mode
@@ -177,9 +229,11 @@ mkNamedPipe (HANDLE* pHandleIn, BOOL isInheritableIn, BOOL isOverlappedIn,
        mode is essentially streaming mode. Typically Haskell would benefit from
        both modes, cabal from byte streaming and iserv from message.  Let's
        default to MESSAGE.  */
-    DWORD pipeFlags = PIPE_READMODE_MESSAGE;
-    if (!SetNamedPipeHandleState (hTemporaryOut, &pipeFlags, NULL, NULL))
-      goto fail;
+    //DWORD pipeFlags = PIPE_READMODE_MESSAGE;
+    //if (!SetNamedPipeHandleState (hTemporaryChild, &pipeFlags, NULL, NULL))
+    //  goto fail;
+    // SLD TODO: this runs into a "Permision denied" error
+    // when we are passing the read end to the child process?
 
     /* Set some optimization flags to make the I/O manager operate more
        efficiently on these handles.  These mirrors those in
@@ -190,13 +244,20 @@ mkNamedPipe (HANDLE* pHandleIn, BOOL isInheritableIn, BOOL isOverlappedIn,
     defined(FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)
     UCHAR flags = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
                   | FILE_SKIP_SET_EVENT_ON_HANDLE;
-    SetFileCompletionNotificationModes (hTemporaryIn, flags);
-    SetFileCompletionNotificationModes (hTemporaryOut, flags);
+    SetFileCompletionNotificationModes (hTemporaryParent, flags);
+    SetFileCompletionNotificationModes (hTemporaryChild, flags);
 #endif
 
     /* Everything has succeeded so now copy the pointers to the results.  */
-    *pHandleIn = hTemporaryIn;
-    *pHandleOut = hTemporaryOut;
+    switch (inherit) {
+      case InheritRead:
+        *pHandleReadEnd = hTemporaryChild;
+        *pHandleWriteEnd = hTemporaryParent;
+        break;
+      default:
+        *pHandleReadEnd = hTemporaryParent;
+        *pHandleWriteEnd = hTemporaryChild;
+    }
 
     return TRUE;
 
@@ -204,8 +265,8 @@ fail:
     /* We have to save the current error before we do another API call.  */
     maperrno();
     RpcStringFreeW (&guidStr);
-    if (INVALID_HANDLE_VALUE != hTemporaryIn ) CloseHandle (hTemporaryIn);
-    if (INVALID_HANDLE_VALUE != hTemporaryOut) CloseHandle (hTemporaryOut);
+    if (INVALID_HANDLE_VALUE != hTemporaryParent) CloseHandle (hTemporaryParent);
+    if (INVALID_HANDLE_VALUE != hTemporaryChild) CloseHandle (hTemporaryChild);
     return FALSE;
 }
 
@@ -278,7 +339,7 @@ setStdHandleInfo (LPHANDLE destination, HANDLE _stdhandle,
             && !mkAnonPipe(hStdRead, isInheritableIn, hStdWrite, isInheritableOut))
             return false;
         if (asynchronous
-            && !mkNamedPipe(hStdRead, isInheritableIn, !isInheritableIn, hStdWrite, isInheritableOut, !isInheritableOut))
+            && !mkNamedPipe(isInheritableIn ? InheritRead : InheritWrite, true, true, hStdRead, hStdWrite))
             return false;
         *destination = *tmpHandle;
     } else if (_stdhandle == (HANDLE)-2) {

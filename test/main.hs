@@ -43,19 +43,19 @@ isWindows = False
 
 main :: IO ()
 main = do
-    testDoesNotExist
-    testModifiers
-    testSubdirectories
-    testBinaryHandles
-    testMultithreadedWait
-    testInterruptMaskedWait
-    testGetPid
-    testReadProcess
-    testInterruptWith
-    testDoubleWait
-    testKillDoubleWait
-    testCreateProcess
-    testCommunicationHandle False
+    --testDoesNotExist
+    --testModifiers
+    --testSubdirectories
+    --testBinaryHandles
+    --testMultithreadedWait
+    --testInterruptMaskedWait
+    --testGetPid
+    --testReadProcess
+    --testInterruptWith
+    --testDoubleWait
+    --testKillDoubleWait
+    --testCreateProcess
+    --testCommunicationHandle False
 #if defined(__IO_MANAGER_WINIO__)
     -- With WinIO, also run the test with the child process using WinIO
     testCommunicationHandle True

@@ -1,6 +1,8 @@
 {-# LANGUAGE CPP, ForeignFunctionInterface #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE InterruptibleFFI #-}
+{-# LANGUAGE PatternSynonyms #-}
+
 module System.Process.Windows
     ( mkProcessHandle
     , translateInternal
@@ -18,6 +20,11 @@ module System.Process.Windows
     , terminateJobUnsafe
     , waitForJobCompletion
     , timeout_Infinite
+
+    , c_mkNamedPipe
+    , pattern NoInheritance
+    , pattern InheritRead
+    , pattern InheritWrite
     ) where
 
 import System.Process.Common
@@ -514,16 +521,22 @@ createPipeInternalHANDLE :: IO (Handle, Handle)
 createPipeInternalHANDLE =
   alloca $ \ pfdStdInput  ->
    alloca $ \ pfdStdOutput -> do
+     let pipeInheritance = NoInheritance
+         isOverlappedChild = True
      throwErrnoIf_  (==False) "c_mkNamedPipe" $
-       c_mkNamedPipe pfdStdInput True False pfdStdOutput True False
+       c_mkNamedPipe NoInheritance True True pfdStdInput pfdStdOutput
      Just hndStdInput  <- mbPipeHANDLE CreatePipe pfdStdInput ReadMode
      Just hndStdOutput <- mbPipeHANDLE CreatePipe pfdStdOutput WriteMode
      return (hndStdInput, hndStdOutput)
+##endif
 
+pattern NoInheritance, InheritRead, InheritWrite :: Int
+pattern NoInheritance = 0
+pattern InheritRead = 1
+pattern InheritWrite = 2
 
 foreign import ccall "mkNamedPipe" c_mkNamedPipe ::
-    Ptr HANDLE -> Bool -> Bool -> Ptr HANDLE -> Bool -> Bool -> IO Bool
-##endif
+  Int -> Bool -> Bool -> Ptr HANDLE -> Ptr HANDLE -> IO Bool
 
 close' :: CInt -> IO ()
 close' = throwErrnoIfMinus1_ "_close" . c__close
