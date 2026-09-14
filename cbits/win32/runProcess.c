@@ -290,13 +290,54 @@ setStdHandleInfo (LPHANDLE destination, HANDLE _stdhandle,
     return true;
 }
 
+/* Note [Concurrent process spawning]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   GHC bug #2650 showed that we need to be careful to avoid child processes
+   inheriting unwanted handles on Windows.
+
+   The close_fds field of CreateProcess specifies the expected behaviour:
+
+     - close_fds = False: the child process inherits all inheritable handles
+       of the parent.
+     - close_fds = True: the child process is handed an explicit list of
+       handles it may inherit, using PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+
+   In a concurrent setting, the first behaviour is problematic: spawning
+   happens in two steps (first creating inheritable pipe handles, then calling
+   CreateProcess), but we don't want a child process to inherit handles created
+   for other (concurrently spawned) children, which can cause write-ends to be
+   left permanently open. That was the bug in #2650.
+
+   Serialising all process creation fixes this, but is too strong: we only need
+   to ensure that no 'close_fds = False' spawn is concurrent with any other
+   spawn (of any kind). Instead, runInteractiveProcessWrapper holds spawnLock,
+   a Windows "Slim Reader/Writer Lock" (SRW lock), for the duration of the spawn.
+   The lock is held in exclusive mode for 'close_fds = False', and in shared
+   mode for 'close_fds = True'.
+
+   Remarks:
+
+     - The lock is acquired and released within a single C call, because SRW
+       locks must be released by the OS thread that acquired it (a Haskell
+       thread may migrate between OS threads across FFI calls).
+     - We use 'safe' FFI calls for process spawning: an unsafe call blocked on
+       the lock would keep its capability, stalling every Haskell thread at
+       the next GC sync.
+     - SRW locks are neither fair nor FIFO, so there is no guarantee that a
+       'close_fds = False' spawn will not be not starved by concurrent
+       'close_fds = True' spawns continously arriving.
+*/
+static SRWLOCK spawnLock = SRWLOCK_INIT;
+
 /* Common functionality between the Posix FD version and native HANDLE version
    of runInteractiveProcess.  The main difference lies in the use of
    ASYNCHRONOUS which indicates whether the pipes that are created allow for
-   asynchronous access or not.  */
+   asynchronous access or not.
 
+   Must only be called after acquiring the process spawning lock;
+   see Note [Concurrent process spawning]. */
 static ProcHandle
-runInteractiveProcessWrapper (
+runInteractiveProcessWithLock (
     wchar_t *cmd, wchar_t *workingDirectory,
     wchar_t *environment,
     HANDLE _stdin, HANDLE _stdout, HANDLE _stderr,
@@ -489,6 +530,39 @@ cleanup_err:
 
     maperrno();
     return NULL;
+}
+
+/* Wrapper around 'runInteractiveProcessWithLock' that acquires the concurrent
+   process spawning lock (see Note [Concurrent process spawning]).  */
+static ProcHandle
+runInteractiveProcessWrapper (
+    wchar_t *cmd, wchar_t *workingDirectory,
+    wchar_t *environment,
+    HANDLE _stdin, HANDLE _stdout, HANDLE _stderr,
+    HANDLE *pStdInput, HANDLE *pStdOutput, HANDLE *pStdError,
+    int flags, bool useJobObject, HANDLE *hJob, bool asynchronous)
+{
+    bool close_fds = (flags & RUN_PROCESS_IN_CLOSE_FDS) != 0;
+
+    if (close_fds) {
+        AcquireSRWLockShared(&spawnLock);
+    } else {
+        AcquireSRWLockExclusive(&spawnLock);
+    }
+
+    ProcHandle result
+      = runInteractiveProcessWithLock (cmd, workingDirectory, environment,
+                                     _stdin, _stdout, _stderr,
+                                     pStdInput, pStdOutput, pStdError,
+                                     flags, useJobObject, hJob, asynchronous);
+
+    if (close_fds) {
+        ReleaseSRWLockShared(&spawnLock);
+    } else {
+        ReleaseSRWLockExclusive(&spawnLock);
+    }
+
+    return result;
 }
 
 /* Note [Windows exec interaction]
