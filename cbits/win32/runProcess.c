@@ -290,6 +290,53 @@ setStdHandleInfo (LPHANDLE destination, HANDLE _stdhandle,
     return true;
 }
 
+/* Release an attribute list returned by 'initProcThreadAttributeList'. */
+static void
+freeProcThreadAttributeList (LPPROC_THREAD_ATTRIBUTE_LIST attrList)
+{
+    DWORD err = GetLastError();
+    DeleteProcThreadAttributeList(attrList);
+    HeapFree(GetProcessHeap(), 0, attrList);
+    SetLastError(err);
+}
+
+/* Initialise an attribute list used to restrict inheritance to the given handles. */
+static LPPROC_THREAD_ATTRIBUTE_LIST
+initProcThreadAttributeList (HANDLE *handles, DWORD nHandles)
+{
+    SIZE_T attrSize = 0;
+    // Pass NULL to 'InitializeProcThreadAttributeList' to set 'attrSize',
+    // which (on success) returns FALSE with last error 'ERROR_INSUFFICIENT_BUFFER'.
+    if (!InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize)
+        && GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return NULL;
+    assert (attrSize > 0);
+
+    // Now allocate 'attrList' and then initialise it.
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList
+      = (LPPROC_THREAD_ATTRIBUTE_LIST) HeapAlloc(GetProcessHeap(), 0, attrSize);
+    if (attrList == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
+        // Allocated but not initialised: free 'attrList'.
+        // Does not call 'DeleteProcThreadAttributeList' as there is nothing to delete.
+        DWORD err = GetLastError();
+        HeapFree(GetProcessHeap(), 0, attrList);
+        SetLastError(err);
+        return NULL;
+    }
+
+    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   handles, nHandles * sizeof(HANDLE),
+                                   NULL, NULL)) {
+        freeProcThreadAttributeList(attrList);
+        return NULL;
+    }
+    return attrList;
+}
+
 /* Note [Concurrent process spawning]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    GHC bug #2650 showed that we need to be careful to avoid child processes
@@ -324,9 +371,10 @@ setStdHandleInfo (LPHANDLE destination, HANDLE _stdhandle,
        the lock would keep its capability, stalling every Haskell thread at
        the next GC sync.
      - SRW locks are neither fair nor FIFO, so there is no guarantee that a
-       'close_fds = False' spawn will not be not starved by concurrent
-       'close_fds = True' spawns continously arriving.
+       'close_fds = False' spawn will not be starved by concurrent
+       'close_fds = True' spawns continuously arriving.
 */
+
 static SRWLOCK spawnLock = SRWLOCK_INIT;
 
 /* Common functionality between the Posix FD version and native HANDLE version
@@ -421,28 +469,8 @@ runInteractiveProcessWithLock (
            shortcut if there are no handles to inherit. */
         inherit = FALSE;
     } else if (nInheritedHandles > 0) {
-        SIZE_T attrSize = 0;
-        InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
-        if (attrSize == 0) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            goto cleanup_err;
-        }
-        attrList = (LPPROC_THREAD_ATTRIBUTE_LIST) HeapAlloc(GetProcessHeap(), 0, attrSize);
-        if (attrList == NULL) {
-            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-            goto cleanup_err;
-        }
-        if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
-            DWORD err = GetLastError();
-            HeapFree(GetProcessHeap(), 0, attrList);
-            attrList = NULL;
-            SetLastError(err);
-            goto cleanup_err;
-        }
-        if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                       inheritedHandles,
-                                       nInheritedHandles * sizeof(HANDLE),
-                                       NULL, NULL))
+        attrList = initProcThreadAttributeList(inheritedHandles, nInheritedHandles);
+        if (attrList == NULL)
             goto cleanup_err;
         sInfoEx.lpAttributeList = attrList;
         sInfo->cb = sizeof(sInfoEx);
@@ -478,8 +506,7 @@ runInteractiveProcessWithLock (
     }
 
     if (attrList != NULL) {
-        DeleteProcThreadAttributeList(attrList);
-        HeapFree(GetProcessHeap(), 0, attrList);
+        freeProcThreadAttributeList(attrList);
         attrList = NULL;
     }
 
@@ -521,12 +548,7 @@ cleanup_err:
     if (hStdErrorRead   != INVALID_HANDLE_VALUE) CloseHandle(hStdErrorRead);
     if (hStdErrorWrite  != INVALID_HANDLE_VALUE) CloseHandle(hStdErrorWrite);
     if (job             != NULL                ) CloseHandle(job);
-    if (attrList != NULL) {
-        DWORD err = GetLastError();
-        DeleteProcThreadAttributeList(attrList);
-        HeapFree(GetProcessHeap(), 0, attrList);
-        SetLastError(err);
-    }
+    if (attrList        != NULL                ) freeProcThreadAttributeList(attrList);
 
     maperrno();
     return NULL;
